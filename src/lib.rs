@@ -282,7 +282,7 @@ fn parse_source(source: &str) -> Result<CstNode, String> {
 /// Re-attach the anonymous keyword tokens of `TOKEN_BEARING` kinds as `MODIFIER_TOKEN` leaves,
 /// in source order, so they get labels, exact UTF-8 byte spans and a share of the structural
 /// hash. `node_to_cst` keeps named children in `named_child` order, so the two trees walk in
-/// lockstep. Extras (comments) stay out.
+/// lockstep. Extras (comments), named or anonymous, stay out.
 fn retain_modifier_tokens(ts: tree_sitter::Node<'_>, cst: &mut CstNode, source: &[u8]) {
     if TOKEN_BEARING.contains(&ts.kind()) {
         let mut named = std::mem::take(&mut cst.children).into_iter();
@@ -291,6 +291,12 @@ fn retain_modifier_tokens(ts: tree_sitter::Node<'_>, cst: &mut CstNode, source: 
             let Some(child) = ts.child(i) else { continue };
             if child.is_named() {
                 if let Some(mut converted) = named.next() {
+                    // A comment inside the qualifier group (`const /* why */ unsafe`,
+                    // `&/* why */mut self`) is trivia: dropping it here keeps its text out
+                    // of the joined label and the structural hash.
+                    if child.is_extra() {
+                        continue;
+                    }
                     retain_modifier_tokens(child, &mut converted, source);
                     children.push(converted);
                 }
@@ -643,6 +649,51 @@ mod tests {
                 ("modifier".to_string(), "unsafe".to_string()),
                 ("reference_type".to_string(), "&mut".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn issue7_comment_inside_modifier_group_or_receiver_is_not_a_fact() {
+        let pairs = [
+            (
+                "const unsafe fn f() {}\n",
+                "const /* why */ unsafe fn f() {}\n",
+            ),
+            (
+                "impl S { fn f(&mut self) {} }\n",
+                "impl S { fn f(&/* why */mut self) {} }\n",
+            ),
+            ("fn f(&mut self) {}\n", "fn f(&/* why */mut self) {}\n"),
+        ];
+        for (old, new) in pairs {
+            assert_eq!(shape(old), shape(new), "labels differ: {old:?} vs {new:?}");
+            assert_eq!(
+                root_hash(old),
+                root_hash(new),
+                "hash differs: {old:?} vs {new:?}"
+            );
+        }
+        assert!(has(
+            "const /* why */ unsafe fn f() {}\n",
+            "function_modifiers",
+            "const unsafe",
+            [0, 0, 0, 22]
+        ));
+        assert!(all_facts("impl S { fn f(&/* why */mut self) {} }\n")
+            .iter()
+            .any(|(t, l, _)| t == "self_parameter" && l == "&mut self"));
+        // Removing the qualifier itself is still meaningful.
+        assert_ne!(
+            root_hash("const /* why */ unsafe fn f() {}\n"),
+            root_hash("const /* why */ fn f() {}\n")
+        );
+        assert_ne!(
+            shape("impl S { fn f(&/* why */mut self) {} }\n"),
+            shape("impl S { fn f(&/* why */self) {} }\n")
+        );
+        assert_ne!(
+            root_hash("impl S { fn f(&/* why */mut self) {} }\n"),
+            root_hash("impl S { fn f(&/* why */self) {} }\n")
         );
     }
 }
